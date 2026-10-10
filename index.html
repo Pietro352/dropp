@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Dropp</title>
-<meta name="description" content="Manda un file a un altro dispositivo: diretto sulla stessa rete, con relay temporaneo fuori rete.">
+<meta name="description" content="Manda un file a un altro dispositivo, direttamente da browser a browser.">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23111214'/%3E%3Cpath d='M30 13v23M20 27l10 10 10-10M17 47h26' fill='none' stroke='%23ececea' stroke-width='4.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='49' cy='16' r='5' fill='%23e9b35f'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -429,7 +429,7 @@
 <header>
   <div>
     <h1>Dropp</h1>
-    <p class="subtitle">Manda un file a un altro dispositivo: diretto sulla stessa rete, con relay temporaneo fuori rete.</p>
+    <p class="subtitle">Manda un file a un altro dispositivo, direttamente da browser a browser.</p>
   </div>
   <button class="help-btn" onclick="openHelp()" title="Come funziona" aria-label="Come funziona">?</button>
 </header>
@@ -462,7 +462,7 @@
       <div class="step-num">3</div>
       <div class="step-body">
         <div class="step-title">Stabilisci la connessione</div>
-        <div class="step-desc">Clicca <strong>Connetti</strong>. Dropp rileva se i dispositivi sono sulla stessa rete e sceglie il metodo più adatto.</div>
+        <div class="step-desc">Clicca <strong>Connetti</strong>. Dropp crea una connessione diretta tra i due browser.</div>
       </div>
     </div>
 
@@ -470,12 +470,12 @@
       <div class="step-num">4</div>
       <div class="step-body">
         <div class="step-title">Invia il file</div>
-        <div class="step-desc">Trascina un file nella zona tratteggiata. Sulla stessa rete parte in P2P; fuori rete passa da un relay temporaneo per massimo 3 minuti.</div>
+        <div class="step-desc">Trascina un file nella zona tratteggiata. Il file viaggia direttamente tra i due dispositivi, senza essere salvato su nessun server.</div>
       </div>
     </div>
 
     <div class="modal-divider"></div>
-    <div class="modal-note">Sulla stessa rete il file passa direttamente tra i browser. Su reti diverse resta sul relay per massimo 3 minuti, poi viene eliminato.</div>
+    <div class="modal-note">Il file passa direttamente tra i browser e non viene mai caricato su un server. Entrambi i dispositivi devono tenere aperta la pagina durante l'invio.</div>
   </div>
 </div>
 
@@ -520,7 +520,7 @@
       <div class="drop-sub">o clicca per sceglierlo</div>
     </div>
     <input type="file" id="fileInput" onchange="onFileSelect(event)" hidden>
-    <div class="transfer-hint" id="transferHint">Il metodo di invio viene scelto automaticamente dopo la connessione.</div>
+    <div class="transfer-hint" id="transferHint">Dopo la connessione il file viaggia direttamente tra i due browser.</div>
     <div class="progress-wrap" id="sendProgress">
       <div class="progress-info">
         <span id="sendFileName">—</span>
@@ -555,53 +555,42 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
-// Su GitHub Pages non esistono le funzioni /api: punta al sito Netlify che le ospita.
-// Se cambi indirizzo al backend, modifica solo questa riga.
-const API_BASE = 'https://warpfile.netlify.app';
+// Dropp funziona solo con GitHub Pages: nessun backend proprio.
+// La segnalazione (scambio ID) usa il server pubblico gratuito di PeerJS,
+// poi i file viaggiano direttamente da browser a browser (WebRTC).
 
 // ─── Stato ─────────────────────────────────────────────
-let pc = null;
-let dc = null;
-let myRoom = null;
-let connectedPeerRoom = null;
-let transferMode = 'p2p';
-let pollTimer = null;
-let inboxTimer = null;
-let inboxBusy = false;
-let cloudSending = false;
-let sessionId = 0; // incremented on reset to cancel stale callbacks
-const CHUNK_SIZE = 64 * 1024;
-const CLOUD_CHUNK_SIZE = 256 * 1024;
-const CLOUD_MAX_FILE_SIZE = 20 * 1024 * 1024;
-const handledCloudTransfers = new Set();
+let peer = null;               // connessione al server di segnalazione
+let conn = null;               // connessione dati attiva con l'altro dispositivo
+let myRoom = null;             // il mio ID (es. BEAR-3557)
+let connectedPeerRoom = null;  // ID dell'altro dispositivo, a connessione aperta
+let sessionId = 0;             // incrementato a ogni nuovo ID per ignorare callback vecchie
+let idRetries = 0;
+let sending = false;
+
+const PEER_PREFIX = 'dropp-';          // evita collisioni sul server pubblico
+const CHUNK_SIZE = 16 * 1024;          // dimensione sicura tra tutti i browser
+const READ_SIZE = 256 * 1024;
+const MAX_BUFFERED = 1024 * 1024;
 
 let recvMeta = null;
 let recvChunks = [];
 let recvReceived = 0;
-let sendTotal = 0;
-let sendSent = 0;
 
-let ICE_SERVERS = [
+// Server STUN/TURN. Per reti molto restrittive serve un server TURN: se ne hai uno
+// tuo (es. su una VM), aggiungilo qui sotto con username e credential.
+const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:global.stun.twilio.com:3478' },
   { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turns:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
-async function loadIceConfig() {
-  try {
-    const data = await fetch(API_BASE + '/api/ice-config').then(r => r.json());
-    if (Array.isArray(data.iceServers) && data.iceServers.length) {
-      ICE_SERVERS = data.iceServers;
-    }
-  } catch (e) {
-    console.warn('ICE config fetch failed, using defaults', e);
-  }
-}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // ─── ID generazione ────────────────────────────────────
 function genId() {
@@ -611,427 +600,237 @@ function genId() {
   return `${word}-${num}`;
 }
 
-// ─── Creazione RTCPeerConnection ───────────────────────
-function makePc() {
-  const p = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  p.onconnectionstatechange = () => {
-    if (p.connectionState === 'disconnected' || p.connectionState === 'failed') {
-      setConnStatus('error', 'connessione persa');
-      dc = null;
-    }
-  };
-  return p;
-}
-
-// ─── Setup data channel ────────────────────────────────
-function setupChannel(channel) {
-  dc = channel;
-  dc.binaryType = 'arraybuffer';
-  dc.onopen = () => {
-    if (pollTimer && connectedPeerRoom) { clearInterval(pollTimer); pollTimer = null; }
-    transferMode = 'p2p';
-    setTransferHint();
-    setConnStatus('connected', 'peer connesso · P2P locale');
-    toast('Connesso in P2P');
-  };
-  dc.onmessage = (e) => handleData(e.data);
-  dc.onclose = () => {
-    setConnStatus('', 'connessione chiusa');
-    dc = null;
-  };
-  dc.onerror = (err) => {
-    setConnStatus('error', 'errore connessione');
-    console.error(err);
-  };
-}
-
-// ─── Avvio come host (trickle ICE) ────────────────────
-async function initHost() {
-  myRoom = genId();
+// ─── Avvio: registra il mio ID sul server di segnalazione ──
+function initHost() {
   const mySession = ++sessionId;
 
-  document.getElementById('myIdDisplay').textContent = myRoom;
-  document.getElementById('myIdDisplay').classList.remove('id-skeleton');
-  setStatus('connecting', 'preparazione...');
+  if (typeof Peer === 'undefined') {
+    document.getElementById('myIdDisplay').textContent = '—';
+    setStatus('error', 'libreria di connessione non caricata');
+    return;
+  }
 
-  try {
-    pc = makePc();
-    setupChannel(pc.createDataChannel('dropp', { ordered: true }));
+  if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
 
-    // Trickle ICE: send candidates as they arrive, sequentially
-    let sendChain = Promise.resolve();
-    pc.onicecandidate = (e) => {
-      if (mySession !== sessionId || !e.candidate) return;
-      const cand = e.candidate.toJSON();
-      sendChain = sendChain.then(() =>
-        fetch(API_BASE + '/api/signal?room=' + myRoom, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ candidate: cand, role: 'host' })
-        }).catch(() => {})
-      );
-    };
+  myRoom = genId();
+  const display = document.getElementById('myIdDisplay');
+  display.textContent = myRoom;
+  display.classList.remove('id-skeleton');
+  document.getElementById('copyBtn').disabled = true;
+  document.getElementById('connectBtn').disabled = true;
+  setStatus('connecting', 'connessione al server…');
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+  const p = new Peer(PEER_PREFIX + myRoom, { debug: 1, config: { iceServers: ICE_SERVERS } });
+  peer = p;
 
+  p.on('open', () => {
     if (mySession !== sessionId) return;
-
-    // POST offer immediately — no waiting for ICE gathering
-    await fetch(API_BASE + '/api/signal?room=' + myRoom, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ offer: pc.localDescription })
-    });
-
+    idRetries = 0;
     document.getElementById('copyBtn').disabled = false;
     document.getElementById('connectBtn').disabled = false;
     setStatus('ready', `pronto · ID: ${myRoom}`);
+  });
 
-    let answerApplied = false;
-    let guestCandIdx  = 0;
+  p.on('connection', (c) => {
+    if (mySession !== sessionId) { c.close(); return; }
+    attachConnection(c);
+  });
 
-    pollTimer = setInterval(async () => {
-      if (mySession !== sessionId) { clearInterval(pollTimer); return; }
-      try {
-        const data = await fetch(`${API_BASE}/api/signal?room=${myRoom}&guestFrom=${guestCandIdx}`).then(r => r.json());
+  p.on('disconnected', () => {
+    if (mySession !== sessionId || p.destroyed) return;
+    setStatus('connecting', 'riconnessione al server…');
+    p.reconnect();
+  });
 
-        if (data.peerRoom) connectedPeerRoom = data.peerRoom;
-
-        if (connectedPeerRoom && dc?.readyState === 'open' && pollTimer) {
-          clearInterval(pollTimer);
-          pollTimer = null;
-        }
-
-        if (data.cloud && data.peerRoom) {
-          transferMode = 'database';
-          setTransferHint();
-          if (dc) dc.onclose = null;
-          if (pc) { pc.close(); pc = null; dc = null; }
-          clearInterval(pollTimer);
-          pollTimer = null;
-          ensureInboxPolling();
-          setConnStatus('connected', 'peer connesso · relay temporaneo');
-          toast('Connesso tramite relay temporaneo');
-          return;
-        }
-
-        // Apply answer once it arrives
-        if (!answerApplied && data.answer && pc?.signalingState !== 'closed') {
-          answerApplied = true;
-          await pc.setRemoteDescription(data.answer);
-        }
-
-        // Apply incoming guest ICE candidates (only after answer is set)
-        if (answerApplied && Array.isArray(data.guestCandidates) && data.guestCandidates.length > 0) {
-          for (const c of data.guestCandidates) {
-            if (c && pc?.signalingState !== 'closed') {
-              await pc.addIceCandidate(c).catch(err => console.warn('addIceCandidate:', err));
-            }
-          }
-          guestCandIdx += data.guestCandidates.length;
-        }
-      } catch (e) { console.error('poll error', e); }
-    }, 1000);
-
-  } catch (e) {
-    console.error(e);
-    setStatus('error', 'errore inizializzazione');
-  }
-}
-
-// ─── Connessione in uscita (guest, trickle ICE) ────────
-async function connectToPeer() {
-  const rawId = document.getElementById('peerIdInput').value.trim().toUpperCase();
-  if (!rawId || rawId.length < 4) return;
-
-  const mySession = ++sessionId;
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  if (pc) { pc.close(); pc = null; dc = null; }
-
-  setConnStatus('connecting', `connessione a ${rawId}...`);
-
-  try {
-    const data = await fetch(API_BASE + '/api/signal?room=' + rawId).then(r => r.json());
+  p.on('error', (err) => {
     if (mySession !== sessionId) return;
-
-    if (!data.offer) {
+    console.error('PeerJS:', err);
+    if (err.type === 'unavailable-id' && idRetries < 5) {
+      idRetries++;
+      initHost();           // ID già occupato: ne genera un altro
+      return;
+    }
+    if (err.type === 'peer-unavailable') {
       setConnStatus('error', 'ID non trovato');
       return;
     }
-
-    connectedPeerRoom = rawId;
-
-    if (data.sameNetwork === false) {
-      await fetch(API_BASE + '/api/signal?room=' + rawId, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cloud: true, peerRoom: myRoom })
-      });
-      transferMode = 'database';
-      setTransferHint();
-      ensureInboxPolling();
-      setConnStatus('connected', 'peer connesso · relay temporaneo');
-      toast('Reti diverse: relay temporaneo attivo');
-      return;
+    if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
+      setStatus('error', 'server non raggiungibile');
+    } else {
+      setStatus('error', 'errore inizializzazione');
     }
+  });
+}
 
-    transferMode = 'p2p';
+// ─── Connessione in uscita ─────────────────────────────
+function connectToPeer() {
+  const rawId = document.getElementById('peerIdInput').value.trim().toUpperCase();
+  if (!rawId || rawId.length < 4) return;
+
+  if (!peer || peer.destroyed || !peer.open) {
+    setConnStatus('error', 'server non raggiungibile');
+    return;
+  }
+  if (rawId === myRoom) {
+    toast('Questo è il tuo ID');
+    return;
+  }
+
+  setConnStatus('connecting', `connessione a ${rawId}...`);
+  const c = peer.connect(PEER_PREFIX + rawId, { reliable: true, serialization: 'raw' });
+  attachConnection(c);
+
+  setTimeout(() => {
+    if (c === conn && !c.open) {
+      try { c.close(); } catch (e) {}
+      conn = null;
+      setConnStatus('error', 'nessuna risposta: controlla ID e rete');
+    }
+  }, 20000);
+}
+
+// ─── Gestione della connessione dati (in entrata e in uscita) ──
+function attachConnection(c) {
+  if (conn && conn !== c) { try { conn.close(); } catch (e) {} }
+  conn = c;
+  let wasOpen = false;
+
+  const onOpen = async () => {
+    if (conn !== c) return;
+    wasOpen = true;
+    connectedPeerRoom = String(c.peer).replace(PEER_PREFIX, '');
     setTransferHint();
+    setConnStatus('connected', 'peer connesso');
+    toast('Connesso');
+    const route = await describeRoute(c);
+    if (conn === c && route) setConnStatus('connected', `peer connesso · ${route}`);
+  };
 
-    pc = makePc();
-    pc.ondatachannel = (e) => setupChannel(e.channel);
+  c.on('open', onOpen);
+  if (c.open) onOpen();
 
-    // Trickle ICE: send candidates as they arrive, sequentially
-    let sendChain = Promise.resolve();
-    pc.onicecandidate = (e) => {
-      if (mySession !== sessionId || !e.candidate) return;
-      const cand = e.candidate.toJSON();
-      sendChain = sendChain.then(() =>
-        fetch(API_BASE + '/api/signal?room=' + rawId, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ candidate: cand, role: 'guest' })
-        }).catch(() => {})
-      );
-    };
+  c.on('data', handleData);
 
-    await pc.setRemoteDescription(data.offer);
+  c.on('close', () => {
+    if (conn !== c) return;
+    conn = null;
+    connectedPeerRoom = null;
+    recvMeta = null; recvChunks = []; recvReceived = 0;
+    hideRecvProgress();
+    setTransferHint();
+    if (wasOpen) setConnStatus('', 'connessione chiusa');
+  });
 
-    // Apply any host candidates already available
-    let hostCandIdx = 0;
-    if (Array.isArray(data.hostCandidates)) {
-      for (const c of data.hostCandidates) {
-        if (c) await pc.addIceCandidate(c).catch(() => {});
-      }
-      hostCandIdx = data.hostCandidates.length;
-    }
+  c.on('error', (err) => {
+    console.error('Connessione:', err);
+    if (conn === c) setConnStatus('error', 'errore connessione');
+  });
+}
 
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-
-    if (mySession !== sessionId) return;
-
-    // POST answer immediately — no waiting for ICE gathering
-    await fetch(API_BASE + '/api/signal?room=' + rawId, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answer: pc.localDescription, peerRoom: myRoom })
+// Dice se la connessione è diretta o passa da un relay TURN
+async function describeRoute(c) {
+  try {
+    const stats = await c.peerConnection.getStats();
+    let pair = null;
+    stats.forEach(r => {
+      if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId);
     });
-
-    setConnStatus('connecting', 'in attesa di connessione...');
-
-    // Poll for additional host ICE candidates
-    pollTimer = setInterval(async () => {
-      if (mySession !== sessionId) { clearInterval(pollTimer); return; }
-      try {
-        const update = await fetch(`${API_BASE}/api/signal?room=${rawId}&hostFrom=${hostCandIdx}`).then(r => r.json());
-
-        if (Array.isArray(update.hostCandidates) && update.hostCandidates.length > 0) {
-          for (const c of update.hostCandidates) {
-            if (c && pc?.signalingState !== 'closed') {
-              await pc.addIceCandidate(c).catch(err => console.warn('addIceCandidate:', err));
-            }
-          }
-          hostCandIdx += update.hostCandidates.length;
-        }
-      } catch (e) { console.error('poll error', e); }
-    }, 1000);
-
+    if (!pair) {
+      stats.forEach(r => {
+        if (!pair && r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r;
+      });
+    }
+    if (!pair) return '';
+    const local = stats.get(pair.localCandidateId);
+    const remote = stats.get(pair.remoteCandidateId);
+    const relayed = local?.candidateType === 'relay' || remote?.candidateType === 'relay';
+    return relayed ? 'via relay TURN' : 'diretto';
   } catch (e) {
-    console.error(e);
-    setConnStatus('error', 'errore di connessione');
+    return '';
   }
 }
 
 // ─── Ricezione dati ────────────────────────────────────
 function handleData(data) {
   if (typeof data === 'string') {
-    const msg = JSON.parse(data);
+    let msg;
+    try { msg = JSON.parse(data); } catch (e) { return; }
+
     if (msg.type === 'file-start') {
       recvMeta = msg;
       recvChunks = [];
       recvReceived = 0;
       showRecvProgress(msg.name, 0);
-    }
-    if (msg.type === 'file-end') {
+    } else if (msg.type === 'file-end') {
+      if (!recvMeta) return;
       const blob = new Blob(recvChunks, { type: recvMeta.mime || 'application/octet-stream' });
       addReceivedFile(recvMeta.name, recvMeta.size, blob);
       hideRecvProgress();
       toast(`Ricevuto: ${recvMeta.name}`);
       recvMeta = null; recvChunks = []; recvReceived = 0;
     }
-  } else {
-    if (!recvMeta) return;
-    recvChunks.push(data);
-    recvReceived += data.byteLength;
-    updateRecvProgress(Math.round((recvReceived / recvMeta.size) * 100));
+    return;
   }
+
+  if (!recvMeta) return;
+  recvChunks.push(data);
+  recvReceived += data.byteLength ?? data.size ?? 0;
+  updateRecvProgress(Math.min(100, Math.round((recvReceived / (recvMeta.size || 1)) * 100)));
 }
 
 // ─── Invio file ────────────────────────────────────────
 async function sendFile(file) {
-  if (!connectedPeerRoom) {
-    toast('Connettiti prima a un peer');
+  if (!conn || !conn.open) {
+    toast('Connettiti prima a un dispositivo');
     return;
   }
-
-  if (transferMode === 'database') {
-    await uploadTemporaryFile(file);
-    return;
-  }
-
-  if (!dc || dc.readyState !== 'open') {
-    toast('Connessione P2P non pronta');
-    return;
-  }
-  sendTotal = file.size;
-  sendSent  = 0;
-  showSendProgress(file.name, 0);
-  dc.send(JSON.stringify({
-    type: 'file-start',
-    name: file.name,
-    size: file.size,
-    mime: file.type || 'application/octet-stream'
-  }));
-  const reader = new FileReader();
-  reader.readAsArrayBuffer(file);
-  reader.onload = () => sendChunks(reader.result, file.name);
-}
-
-async function uploadTemporaryFile(file) {
-  if (cloudSending) {
+  if (sending) {
     toast('Attendi la fine dell’invio corrente');
     return;
   }
-  if (file.size > CLOUD_MAX_FILE_SIZE) {
-    toast('Fuori rete il limite è 20 MB');
-    return;
-  }
 
-  cloudSending = true;
+  sending = true;
+  const c = conn;
   showSendProgress(file.name, 0);
 
   try {
-    const chunkCount = Math.ceil(file.size / CLOUD_CHUNK_SIZE);
-    const initResponse = await fetch(API_BASE + '/api/transfer?action=init', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        senderRoom: myRoom,
-        recipientRoom: connectedPeerRoom,
-        fileName: file.name,
-        mimeType: file.type || 'application/octet-stream',
-        fileSize: file.size,
-        chunkCount
-      })
-    });
-    if (!initResponse.ok) throw new Error('Impossibile preparare il trasferimento');
-    const transfer = await initResponse.json();
+    c.send(JSON.stringify({
+      type: 'file-start',
+      name: file.name,
+      size: file.size,
+      mime: file.type || 'application/octet-stream'
+    }));
 
-    for (let index = 0; index < chunkCount; index++) {
-      const start = index * CLOUD_CHUNK_SIZE;
-      const chunk = file.slice(start, Math.min(start + CLOUD_CHUNK_SIZE, file.size));
-      const response = await fetch(`${API_BASE}/api/transfer?action=chunk&id=${encodeURIComponent(transfer.id)}&index=${index}`, {
-        method: 'PUT',
-        headers: { 'x-transfer-token': transfer.writeToken },
-        body: chunk
-      });
-      if (!response.ok) throw new Error('Invio interrotto');
-      updateSendProgress(Math.round(((index + 1) / Math.max(chunkCount, 1)) * 100));
+    let offset = 0;
+    while (offset < file.size) {
+      if (!c.open) throw new Error('connessione chiusa');
+      const end = Math.min(offset + READ_SIZE, file.size);
+      const block = await file.slice(offset, end).arrayBuffer();
+
+      for (let i = 0; i < block.byteLength; i += CHUNK_SIZE) {
+        // non riempire la coda: aspetta che il canale si svuoti
+        while (c.dataChannel && c.dataChannel.bufferedAmount > MAX_BUFFERED) {
+          if (!c.open) throw new Error('connessione chiusa');
+          await sleep(25);
+        }
+        c.send(block.slice(i, Math.min(i + CHUNK_SIZE, block.byteLength)));
+      }
+
+      offset = end;
+      updateSendProgress(Math.round((offset / file.size) * 100));
     }
 
-    const completeResponse = await fetch(API_BASE + '/api/transfer?action=complete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: transfer.id, writeToken: transfer.writeToken })
-    });
-    if (!completeResponse.ok) throw new Error('Trasferimento incompleto');
-
+    c.send(JSON.stringify({ type: 'file-end', name: file.name }));
     updateSendProgress(100);
-    toast(`Inviato per 3 minuti: ${file.name}`);
+    toast(`Inviato: ${file.name}`);
     setTimeout(hideSendProgress, 1200);
   } catch (error) {
     console.error(error);
     hideSendProgress();
-    toast('Invio temporaneo non riuscito');
+    toast('Invio interrotto');
   } finally {
-    cloudSending = false;
+    sending = false;
   }
-}
-
-async function pollTemporaryInbox() {
-  if (!myRoom || inboxBusy) return;
-  inboxBusy = true;
-  try {
-    const response = await fetch(`${API_BASE}/api/transfer?action=list&room=${encodeURIComponent(myRoom)}`, { cache: 'no-store' });
-    if (!response.ok) return;
-    const data = await response.json();
-    for (const transfer of data.transfers || []) {
-      if (handledCloudTransfers.has(transfer.id)) continue;
-      handledCloudTransfers.add(transfer.id);
-      try {
-        await downloadTemporaryTransfer(transfer);
-      } catch (error) {
-        handledCloudTransfers.delete(transfer.id);
-        console.error(error);
-      }
-    }
-  } finally {
-    inboxBusy = false;
-  }
-}
-
-function ensureInboxPolling() {
-  if (inboxTimer) return;
-  pollTemporaryInbox();
-  inboxTimer = setInterval(pollTemporaryInbox, 2000);
-}
-
-async function downloadTemporaryTransfer(transfer) {
-  showRecvProgress(transfer.fileName, 0);
-  const chunks = [];
-
-  for (let index = 0; index < transfer.chunkCount; index++) {
-    const response = await fetch(
-      `${API_BASE}/api/transfer?action=chunk&id=${encodeURIComponent(transfer.id)}&room=${encodeURIComponent(myRoom)}&index=${index}`,
-      { cache: 'no-store' }
-    );
-    if (!response.ok) throw new Error('File temporaneo non disponibile');
-    chunks.push(await response.arrayBuffer());
-    updateRecvProgress(Math.round(((index + 1) / Math.max(transfer.chunkCount, 1)) * 100));
-  }
-
-  const blob = new Blob(chunks, { type: transfer.mimeType || 'application/octet-stream' });
-  addReceivedFile(transfer.fileName, transfer.fileSize, blob);
-  hideRecvProgress();
-  toast(`Ricevuto: ${transfer.fileName}`);
-
-  await fetch(`${API_BASE}/api/transfer?id=${encodeURIComponent(transfer.id)}&room=${encodeURIComponent(myRoom)}`, {
-    method: 'DELETE'
-  }).catch(() => {});
-}
-
-function sendChunks(buffer, name) {
-  let offset = 0;
-  function sendNext() {
-    if (!dc || dc.readyState !== 'open') { hideSendProgress(); return; }
-    if (dc.bufferedAmount > 2 * 1024 * 1024) { setTimeout(sendNext, 50); return; }
-    const end   = Math.min(offset + CHUNK_SIZE, buffer.byteLength);
-    const chunk = buffer.slice(offset, end);
-    dc.send(chunk);
-    offset = end;
-    sendSent = offset;
-    updateSendProgress(Math.round((sendSent / sendTotal) * 100));
-    if (offset < buffer.byteLength) {
-      setTimeout(sendNext, 0);
-    } else {
-      dc.send(JSON.stringify({ type: 'file-end', name }));
-      toast(`Inviato: ${name}`);
-      setTimeout(hideSendProgress, 1200);
-    }
-  }
-  sendNext();
 }
 
 // ─── Drop zone ─────────────────────────────────────────
@@ -1082,13 +881,9 @@ function setConnStatus(state, text) {
 
 function setTransferHint() {
   const hint = document.getElementById('transferHint');
-  if (!connectedPeerRoom) {
-    hint.textContent = 'Il metodo di invio viene scelto automaticamente dopo la connessione.';
-  } else if (transferMode === 'database') {
-    hint.textContent = 'Reti diverse: relay temporaneo Netlify, massimo 20 MB, eliminazione entro 3 minuti.';
-  } else {
-    hint.textContent = 'Stessa rete rilevata: trasferimento diretto peer-to-peer.';
-  }
+  hint.textContent = connectedPeerRoom
+    ? 'Connesso: il file viaggia direttamente tra i due browser, senza passare da nessun server.'
+    : 'Dopo la connessione il file viaggia direttamente tra i due browser.';
 }
 
 function copyId() {
@@ -1165,7 +960,8 @@ function escHtml(s) {
 }
 
 // ─── Avvio ─────────────────────────────────────────────
-loadIceConfig().then(() => initHost());
+initHost();
+window.addEventListener('beforeunload', () => { if (peer) peer.destroy(); });
 
 // ─── Help modal ────────────────────────────────────────
 function openHelp() {
